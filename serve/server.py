@@ -1385,6 +1385,43 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def profile(self, path: str, timeout: float = 120.0) -> dict:
+        """Project a complete expert profile between requests and return the engine's measured transfer cost."""
+        if not isinstance(path, str) or not path or any(c in path for c in "\r\n\0"):
+            raise ValueError("profile path must be a non-empty string without control characters")
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write(f"PROFILE {path}\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the PROFILE command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the PROFILE command")
+            if line.startswith("PROFILED "):
+                fields = line.split()
+                if len(fields) != 5:
+                    raise EngineDied("the engine returned a malformed PROFILED response")
+                try:
+                    epoch, swaps, one_way_bytes = map(int, fields[1:4])
+                    milliseconds = float(fields[4])
+                except ValueError:
+                    raise EngineDied("the engine returned a malformed PROFILED response") from None
+                if min(epoch, swaps, one_way_bytes) < 0 or not math.isfinite(milliseconds) or milliseconds < 0:
+                    raise EngineDied("the engine returned a malformed PROFILED response")
+                out = {"epoch": epoch, "swaps": swaps, "one_way_bytes": one_way_bytes,
+                       "milliseconds": milliseconds}
+                self.info["profile"] = out
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the PROFILE command")
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -4383,6 +4420,30 @@ class Service:
                 ctl.release()
             self.fifo.release()
 
+    def profile(self, path: str) -> dict:
+        """Apply an expert profile between requests. The engine remains loaded and owns validation."""
+        if not hasattr(self.engine, "profile"):
+            raise ValueError("this engine cannot switch expert profiles at runtime")
+        if not isinstance(path, str) or not path or any(c in path for c in "\r\n\0"):
+            raise ValueError("path must be a non-empty string without control characters")
+        if not self.fifo.acquire(timeout=self.vram_wait_s):
+            raise ModelBusy("a request is still running; try again when it has finished")
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
+            self.fifo.release()
+            raise ModelBusy("a request is still running; try again when it has finished")
+        try:
+            if not self.loaded():
+                raise EngineDied("the engine is not running")
+            out = self.engine.profile(path)
+            print(f"[strata] PROFILE: epoch {out['epoch']}, {out['swaps']} swaps, "
+                  f"{out['one_way_bytes']} one-way bytes in {out['milliseconds']:.1f} ms", flush=True)
+            return {"status": "ok", **out}
+        finally:
+            if ctl is not None:
+                ctl.release()
+            self.fifo.release()
+
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
@@ -6816,6 +6877,14 @@ def make_handler(svc: Service):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
                         self._json(200, svc.vram(r))
+                    except EngineDied as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/profile":
+                    if not self._own_page("the expert profile can be changed"):
+                        return
+                    try:
+                        self._json(200, svc.profile(req.get("path")))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

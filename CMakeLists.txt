@@ -653,6 +653,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_profile_version_test COMMAND expert_profile_version_test)
     set_tests_properties(expert_profile_version_test PROPERTIES TIMEOUT 60)
   endif()
+# Runtime profile projection keeps the allocated per-layer slot shape (CPU only).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_switch_test.cpp")
+  enable_testing()
+  add_executable(expert_profile_switch_test tests/core/expert_profile_switch_test.cpp)
+  target_link_libraries(expert_profile_switch_test PRIVATE strata_engine)
+  add_test(NAME expert_profile_switch_test COMMAND expert_profile_switch_test)
+  set_tests_properties(expert_profile_switch_test PROPERTIES TIMEOUT 60)
+endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions

@@ -54,6 +54,22 @@ inline constexpr int32_t kNotResident = -1;
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 
+/// A request-boundary profile switch keeps the cache arena's existing per-layer shape and changes only which
+/// experts occupy those slots.  This is deliberately not a fresh-start allocation: native expert blobs differ by
+/// layer, and the captured execution plans keep the arena's slot offsets.
+struct ExpertProfileSwap {
+    int32_t layer;
+    int32_t in;
+    int32_t out;
+};
+
+/// Validate a complete profile ranking and project it into the per-layer slot counts described by `resident`.
+/// `resident` is the n_layers x n_expert host residency table (slot >= 0).  The result contains same-layer swaps,
+/// ordered by the requested ranking.  False leaves `swaps` empty and explains the invalid input in `err`.
+bool plan_expert_profile_switch(int64_t n_layers, int64_t n_expert, const std::vector<int32_t>& resident,
+                                const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                                std::vector<ExpertProfileSwap>& swaps, std::string& err);
+
 /// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
 /// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
 /// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine

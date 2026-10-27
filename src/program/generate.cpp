@@ -994,6 +994,8 @@ void usage() {
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
+                 "  serve command PROFILE P  between requests, project complete profile P into the current\n"
+                 "                       per-layer cache shape; replies PROFILED epoch swaps bytes ms\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -11413,6 +11415,137 @@ int main(int argc, char** argv) {
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        int64_t profile_epoch = 0;
+        std::string active_profile = o.expert_profile;
+        auto switch_profile = [&](const std::string& path, std::string& e, bool& fatal, int64_t& n_swaps,
+                                  uint64_t& moved_bytes, double& elapsed_ms) -> bool {
+            fatal = false;
+            n_swaps = 0;
+            moved_bytes = 0;
+            elapsed_ms = 0.0;
+            const Clock::time_point t0 = Clock::now();
+            if (path.empty()) { e = "PROFILE: missing profile path"; return false; }
+            // shortcut: fixed cache shape on one local GPU, rebuild cache plans before hot reshaping or multi-GPU.
+            if (multi_gpu || !stages.empty() || peer.valid() || remote_opt) {
+                e = "PROFILE: runtime switching currently supports one local GPU only";
+                return false;
+            }
+            if (srcp != &src || !src.complement_ready()) {
+                e = "PROFILE: runtime switching needs the resident RAM complement";
+                return false;
+            }
+            if (xcache.slots() != xcache.full_slots()) {
+                e = "PROFILE: restore the full elastic VRAM cache before switching";
+                return false;
+            }
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty()) { e = "PROFILE: the prompt cache loan is still active"; return false; }
+            if (!ver.wait_commit(e)) { fatal = true; e = "PROFILE: " + e; return false; }
+            apply_pending(true);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                fatal = true;
+                e = std::string("PROFILE: device synchronization failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+
+            std::vector<std::pair<int32_t, int32_t>> ranked;
+            int64_t declared_slots = 0;
+            if (!strata::core::read_expert_profile(path, g.n_layers, g.n_expert, ranked, declared_slots, e)) {
+                e = "PROFILE: " + e;
+                return false;
+            }
+            std::vector<strata::core::ExpertProfileSwap> swaps;
+            if (!strata::core::plan_expert_profile_switch(g.n_layers, g.n_expert, host_res, ranked, swaps, e)) {
+                e = "PROFILE: " + e;
+                return false;
+            }
+            for (const auto& s : swaps) {
+                const size_t in = (size_t) s.layer * (size_t) g.n_expert + (size_t) s.in;
+                const size_t out = (size_t) s.layer * (size_t) g.n_expert + (size_t) s.out;
+                if (host_res[in] >= 0 || host_res[out] < 0) {
+                    e = "PROFILE: requested placement no longer matches the current GPU cache";
+                    return false;
+                }
+            }
+            if (!swaps.empty() && src.exchange_capacity() <= 0 &&
+                !src.reserve_exchanges(std::min<int64_t>(32, (int64_t) swaps.size()), e)) {
+                e = "PROFILE: " + e;
+                return false;
+            }
+            const int64_t cap = src.exchange_capacity();
+            if (!swaps.empty() && cap <= 0) { e = "PROFILE: no resident exchange buffers"; return false; }
+
+            auto home_of = [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; };
+            for (size_t at = 0; at < swaps.size();) {
+                const size_t count = std::min<size_t>((size_t) cap, swaps.size() - at);
+                std::vector<strata::core::ExpertProfileSwap> chunk(swaps.begin() + (ptrdiff_t) at,
+                                                                   swaps.begin() + (ptrdiff_t) (at + count));
+                int64_t expected_exchanges = 0;
+                for (const auto& s : chunk)
+                    expected_exchanges += src.has_resident(s.layer, s.in) && !src.has_resident(s.layer, s.out);
+                if (!resident_stage_swaps(src, host_res, g.n_expert, chunk, home_of) || chunk.size() != count) {
+                    fatal = true;
+                    e = "PROFILE: failed to stage the resident expert exchange";
+                    return false;
+                }
+                std::vector<int32_t> slots;
+                slots.reserve(chunk.size());
+                for (const auto& s : chunk) {
+                    const size_t out = (size_t) s.layer * (size_t) g.n_expert + (size_t) s.out;
+                    const int32_t slot = host_res[out];
+                    const uint8_t* blob = srcp->blob_stable(s.layer, s.in);
+                    const int64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                    if (slot < 0 || blob == nullptr || !xcache.fill_slot_queued(slot, blob, e, bytes)) {
+                        fatal = true;
+                        e = "PROFILE: failed to queue a GPU expert refill: " + e;
+                        return false;
+                    }
+                    slots.push_back(slot);
+                    moved_bytes += (uint64_t) bytes;
+                }
+                if (!xcache.sync_queued(e)) {
+                    fatal = true;
+                    e = "PROFILE: failed to finish GPU expert refills: " + e;
+                    return false;
+                }
+                if (!chunk.empty()) {
+                    const auto& first = chunk.front();
+                    const uint8_t* blob = srcp->blob_stable(first.layer, first.in);
+                    if (blob == nullptr || !xcache.verify_slot(slots.front(), blob, e,
+                            strata::kernels::cpu::expert_layout().blob_bytes(first.layer))) {
+                        fatal = true;
+                        e = "PROFILE: migrated slot verification failed: " + e;
+                        return false;
+                    }
+                }
+                if (src.commit_exchanges() != expected_exchanges) {
+                    fatal = true;
+                    e = "PROFILE: resident expert exchange commit was incomplete";
+                    return false;
+                }
+                for (size_t i = 0; i < chunk.size(); ++i) {
+                    const auto& s = chunk[i];
+                    host_res[(size_t) s.layer * (size_t) g.n_expert + (size_t) s.out] =
+                        strata::core::kNotResident;
+                    host_res[(size_t) s.layer * (size_t) g.n_expert + (size_t) s.in] = slots[i];
+                    srcp->release(s.layer, s.in);
+                }
+                at += count;
+            }
+            res_upload();
+            std::fill(drive.d.usage.begin(), drive.d.usage.end(), 0.0f);
+            std::fill(heat.begin(), heat.end(), 0.0);
+            profile_loaded = ranked;
+            active_profile = path;
+            ++profile_epoch;
+            n_swaps = (int64_t) swaps.size();
+            elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata serve: runtime profile epoch %lld: %lld same-layer swaps, %.1f MiB each "
+                                 "direction in %.1f ms (%s)\n",
+                         (long long) profile_epoch, (long long) n_swaps, (double) moved_bytes / 1048576.0,
+                         elapsed_ms, active_profile.c_str());
+            return true;
+        };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -12031,6 +12164,28 @@ int main(int argc, char** argv) {
             if (!adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
+            }
+            if (line.rfind("PROFILE", 0) == 0) {
+                std::string perr;
+                bool fatal = false;
+                int64_t swaps = 0;
+                uint64_t bytes = 0;
+                double ms = 0.0;
+                bool ok = false;
+                if (line.rfind("PROFILE ", 0) != 0)
+                    perr = "PROFILE: expected PROFILE <path>";
+                else if (batch_on())
+                    perr = "PROFILE: not while batch slots are decoding";
+                else
+                    ok = switch_profile(line.substr(8), perr, fatal, swaps, bytes, ms);
+                if (ok)
+                    std::printf("PROFILED %lld %lld %llu %.1f\n", (long long) profile_epoch,
+                                (long long) swaps, (unsigned long long) bytes, ms);
+                else
+                    std::printf("ERR %s\n", perr.c_str());
+                std::fflush(stdout);
+                if (fatal) return 1;
+                continue;
             }
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {

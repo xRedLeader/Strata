@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <cstdlib>
+#include <limits>
 #include <utility>
 #include <cstring>
 
@@ -137,6 +138,80 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         ranked[(size_t) i] = {l, e};
     }
     slots = (int64_t) want;
+    return true;
+}
+
+bool plan_expert_profile_switch(int64_t n_layers, int64_t n_expert, const std::vector<int32_t>& resident,
+                                const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                                std::vector<ExpertProfileSwap>& swaps, std::string& err) {
+    swaps.clear();
+    err.clear();
+    if (n_layers <= 0 || n_expert <= 0 ||
+        (uint64_t) n_layers > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) n_expert) {
+        err = "profile switch: invalid model geometry";
+        return false;
+    }
+    const size_t count = (size_t) n_layers * (size_t) n_expert;
+    if (resident.size() != count) {
+        err = "profile switch: residency table does not match the model geometry";
+        return false;
+    }
+    if (ranked.size() != count) {
+        err = "profile switch: profile must rank every model expert exactly once";
+        return false;
+    }
+
+    std::vector<int64_t> quota((size_t) n_layers, 0), remaining;
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t e = 0; e < n_expert; ++e)
+            if (resident[(size_t) (l * n_expert + e)] >= 0) ++quota[(size_t) l];
+    remaining = quota;
+
+    std::vector<uint8_t> seen(count, 0), target(count, 0);
+    for (const auto& [l, e] : ranked) {
+        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
+            err = "profile switch: ranked pair is outside the model geometry";
+            return false;
+        }
+        const size_t i = (size_t) l * (size_t) n_expert + (size_t) e;
+        if (seen[i]) {
+            err = "profile switch: profile repeats a ranked pair";
+            return false;
+        }
+        seen[i] = 1;
+        if (remaining[(size_t) l] > 0) {
+            target[i] = 1;
+            --remaining[(size_t) l];
+        }
+    }
+    if (std::any_of(remaining.begin(), remaining.end(), [](int64_t n) { return n != 0; })) {
+        err = "profile switch: profile cannot fill the current per-layer cache shape";
+        return false;
+    }
+
+    std::vector<std::vector<int32_t>> outgoing((size_t) n_layers);
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const size_t i = (size_t) l * (size_t) n_expert + (size_t) e;
+            if (resident[i] >= 0 && !target[i]) outgoing[(size_t) l].push_back((int32_t) e);
+        }
+    std::vector<size_t> next((size_t) n_layers, 0);
+    for (const auto& [l, e] : ranked) {
+        const size_t i = (size_t) l * (size_t) n_expert + (size_t) e;
+        if (!target[i] || resident[i] >= 0) continue;
+        if (next[(size_t) l] >= outgoing[(size_t) l].size()) {
+            swaps.clear();
+            err = "profile switch: projected incoming and outgoing slot counts differ";
+            return false;
+        }
+        swaps.push_back({l, e, outgoing[(size_t) l][next[(size_t) l]++]});
+    }
+    for (int64_t l = 0; l < n_layers; ++l)
+        if (next[(size_t) l] != outgoing[(size_t) l].size()) {
+            swaps.clear();
+            err = "profile switch: projected incoming and outgoing slot counts differ";
+            return false;
+        }
     return true;
 }
 
