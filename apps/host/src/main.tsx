@@ -22,14 +22,18 @@ async function openApplication() {
   if (response.status === 401) throw new Error('Open this Strata window from MicroExpert Lab to reconnect.');
   const connection = response.ok ? await response.json() : null;
   if (connection?.managed) {
+    document.documentElement.dataset.labManaged = '1';
     const banner = document.createElement('div');
     banner.setAttribute('role', 'status');
-    banner.textContent = 'Connected to MicroExpert Lab. Model-backed chat, research and runtime switching are not enabled yet. ';
+    banner.textContent = 'Managed by MicroExpert Lab. Two-response qualification only: use a fresh conversation and send Reply with exactly READY. No tools, research, or general chat. ';
     const back = document.createElement('a');
     back.textContent = 'Return to Lab';
     back.href = connection.lab_url;
     back.style.cssText = 'color:inherit;text-decoration:underline';
-    banner.append(back);
+    const runtime = document.createElement('span');
+    runtime.dataset.labRuntime = '1';
+    runtime.textContent = ' Checking owned runtime… ';
+    banner.append(runtime, back);
     banner.style.cssText = 'padding:10px 16px;background:#25353f;color:#fff;font:14px system-ui;';
     el!.before(banner);
     document.body.style.cssText = 'display:grid;grid-template-rows:auto minmax(0,1fr)';

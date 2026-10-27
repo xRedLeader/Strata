@@ -2,7 +2,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 const READS = new Set([
-  '/api/health', '/api/setup', '/api/hardware', '/api/models', '/api/engine',
+  '/api/lab/runtime', '/api/health', '/api/setup', '/api/hardware', '/api/models', '/api/engine',
   '/api/serving', '/api/monitor', '/api/skills', '/api/model-providers', '/api/image-models',
   '/api/runtime', '/api/workspaces', '/api/workspace', '/api/events', '/api/fonts',
   '/api/app/mode', '/api/control/status', '/api/native', '/api/agent/status',
@@ -23,6 +23,8 @@ export function labConfig(env = process.env) {
 }
 
 export const MANAGED = labConfig();
+export const LAB_SAMPLING = Object.freeze({temperature:0, top_p:1, top_k:1, min_p:0,
+  repeat_penalty:1, seed:1234, max_tokens:16, reasoning_effort:'none'});
 const equal = (a, b) => typeof a === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
 export function createLabAccess(config, { now = Date.now } = {}) {
@@ -62,7 +64,7 @@ export function managedStatus(config) {
     lab_url: new URL(config.baseUrl).origin,
     workspace_identity: config.workspace, model_control: 'MicroExpert Lab', tools_enabled: false,
     research_enabled: false, automatic_downloads: false, fallback_enabled: false,
-    qualification: 'UI connection only; real runtime and research require separate qualification' };
+    qualification: 'Bounded two-response runtime qualification; general chat and research remain unqualified' };
 }
 
 export async function managedBackend(config, fetchImpl = fetch) {

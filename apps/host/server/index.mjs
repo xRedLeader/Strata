@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { MANAGED, createLabAccess, managedStatus } from './lab-managed.mjs';
+import { MANAGED, createLabAccess, managedStatus, managedBackend } from './lab-managed.mjs';
 import { engineProgressMark } from './agent/engine-progress.mjs';
 import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
@@ -634,7 +634,7 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
 async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0 }) {
   if (MANAGED) {
     try {
-      if (remoteModel || nativeModelId || images.length || useTools || history.length > 40 || message.length > 8192
+      if (remoteModel || nativeModelId || images.length || useTools || history.length !== 0 || message.length > 8192
           || history.some(m => !m || !['user','assistant'].includes(m.role) || typeof m.content !== 'string')
           || history.reduce((n,m) => n + m.content.length, message.length) > 8192)
         throw new Error('This managed window accepts bounded text for the Lab-selected runtime only.');
@@ -1009,6 +1009,7 @@ const server = http.createServer(async (req, res) => {
 async function api(req, res, path, method, url) {
   if (path === '/api/lab/managed' && method === 'GET') return json(res, 200, { managed: false });
   if (MANAGED && method === 'GET') {
+    if (path === '/api/lab/runtime') return json(res, 200, await managedBackend(MANAGED));
     if (path === '/api/setup') return json(res, 200, { ...setupState(), complete: true, dismissed: false });
     if (path === '/api/skills') return json(res, 200, []);
     if (path === '/api/workspace') return json(res, 200, { path: WORKSPACE, entries: [] });

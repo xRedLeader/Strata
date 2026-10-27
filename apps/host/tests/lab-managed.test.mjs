@@ -1,11 +1,19 @@
 /** Synthetic protocol fixtures. No engine, model files, source packets, or web requests. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { labConfig, createLabAccess, managedBackend, managedStatus } from '../server/lab-managed.mjs';
+import { labConfig, createLabAccess, managedBackend, managedStatus, LAB_SAMPLING } from '../server/lab-managed.mjs';
 
 const env = { STRATA_LAB_MANAGED:'1', STRATA_LAB_INSTANCE:'1'.repeat(32), STRATA_LAB_WORKSPACE:'2'.repeat(64),
   STRATA_LAB_CONTROL_TOKEN:'3'.repeat(64), STRATA_LAB_INFERENCE_URL:'http://127.0.0.1:8765/mel/v1/strata/runtime/v1' };
 const config = labConfig(env);
+test('mechanical runtime sampling is frozen and model projection is read-only', () => {
+  assert.deepEqual(LAB_SAMPLING, {temperature:0, top_p:1, top_k:1, min_p:0, repeat_penalty:1,
+    seed:1234, max_tokens:16, reasoning_effort:'none'});
+  assert.ok(Object.isFrozen(LAB_SAMPLING));
+  const access = createLabAccess(config);
+  assert.ok(access.allowed('GET','/api/lab/runtime'));
+  assert.equal(access.allowed('POST','/api/lab/runtime'),false);
+});
 test('standalone behavior remains opt-in; managed identities and endpoint are required', () => {
   assert.equal(labConfig({}), null);
   for (const patch of [{STRATA_LAB_INSTANCE:'foreign'}, {STRATA_LAB_CONTROL_TOKEN:''}, {STRATA_LAB_INFERENCE_URL:'http://example.com/v1'},
