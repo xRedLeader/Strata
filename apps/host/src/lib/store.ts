@@ -17,6 +17,7 @@ import { photoData, uploadChatPhotos, photoHistorySlots, pendingChatPhotos, take
 import { applyNativeEvent, nativeState } from './native';
 import { pictureStatus } from './pictures';
 import { noModelNotice } from './no-model';
+import { readLabRuntime } from './lab-runtime';
 import { taskHandoverMessage, taskHandoverTitle, chatHandoverMessage, chatHandoverTitle } from './task-handover';
 import type { Task } from './tasks';
 import { postWithFolderFallback } from './folder-pick';
@@ -1645,8 +1646,13 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
     else startTimeSkipDemo(demoPrompt);
     return;
   }
-  // Whatever sent this (the box, a loop, a plan): with no model to answer, say so in plain words and start nothing.
-  if (state.connection === 'live') {
+  // Recheck managed readiness at Send; the banner may be stale. The host still authorizes every request.
+  if (document.documentElement.dataset.labManaged === '1') {
+    const session = state.activeSession;
+    const runtime = await readLabRuntime();
+    if (!runtime.loaded) { pushToast('info', 'No Lab runtime is ready', 'Review the runtime in MicroExpert Lab. No other model was selected.'); return; }
+    if (state.streaming || state.activeSession !== session) return;
+  } else if (state.connection === 'live') {
     // The first read of the engine's state has not come back yet: do not say "no model" about something not known yet, and do not send.
     if (!nativeState() && !state.remoteModel && !state.library?.loaded) { pushToast('info', 'Still starting up', 'Strata is still checking your models. Try again in a moment.'); return; }
     const why = noModelNotice(nativeState(), { remote: !!state.remoteModel, libraryLoaded: !!state.library?.loaded });
