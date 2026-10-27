@@ -12,6 +12,13 @@ import { defaultModelDirectory } from './model-directory-default.mjs';
  * folder next to the checkout rather than failing to boot.
  */
 function resolveHome() {
+  if (process.env.STRATA_LAB_MANAGED === '1') {
+    const dir = process.env.STRATA_HOME;
+    if (!dir) throw new Error('Lab home is required; no fallback to personal Strata data.');
+    mkdirSync(join(dir, 'models'), { recursive: true });
+    mkdirSync(join(dir, 'data'), { recursive: true });
+    return dir;
+  }
   const candidates = [process.env.STRATA_HOME, join(homedir(), '.strata'), join(process.cwd(), '.strata')].filter(
     Boolean,
   );

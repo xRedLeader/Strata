@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { MANAGED, createLabAccess, managedStatus } from './lab-managed.mjs';
 import { engineProgressMark } from './agent/engine-progress.mjs';
 import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
@@ -97,6 +98,7 @@ const DIST = process.env.STRATA_DIST
     : join(ROOT, 'dist');
 const PORT = Number(process.env.STRATA_PORT ?? 8791);
 const HOST = process.env.STRATA_BIND ?? '127.0.0.1';
+const labAccess = MANAGED ? createLabAccess(MANAGED) : null;
 /* The folder chats work in when nothing else is chosen. It is never the app's own folder (the host is started inside its install
    directory, so `process.cwd()` was "host" in the sidebar and the agent could read and write the app): the person's own
    Documents\Strata\Workspace (the models folder is next to it, not in it), created on first use, unless STRATA_WORKSPACE names one. */
@@ -118,7 +120,7 @@ const hub = new EventHub();
 const modelProviders = createModelProviders({ directory: store.DATA_DIR, changed: value => hub.send('providers', withPictureAnswers(value)) });
 const imageModels = createImageModels({ dataDir: store.DATA_DIR, modelsDir: () => store.MODELS_DIR, real: models.REAL, changed: value => hub.send('image-models', value) });
 /* The installed app ships Strata Control (python + strata_control) next to the host; a source checkout has none and keeps its older paths. */
-const CONTROL = findControl();
+const CONTROL = MANAGED ? null : findControl();
 const control = createControl({ control: CONTROL });
 // Files a run as administrator made in Strata's own folders (owner Administrators) are given back to the user at every start; best effort, never blocks.
 if (control && process.platform === 'win32' && !process.env.STRATA_NO_REPAIR_ACCESS) void control.repairAccess().catch(() => {});
@@ -235,7 +237,7 @@ function runtimeState(){
   return runtimeModels.state();
 }
 
-const startupModelId = process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
+const startupModelId = !MANAGED && process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
 if (startupModelId) {
   monitor.setModel(startupModelId);
   const lastId = startupModelId;
@@ -630,6 +632,16 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
 }
 
 async function runTurn({ message, history = [], onFrame, signal, client, workspaceId = null, sessionId = null, remoteModel = null, runtimeModelId = undefined, nativeModelId, images=[], useTools=false, thinking='medium', thinkingBudget=0 }) {
+  if (MANAGED) {
+    try {
+      if (remoteModel || nativeModelId || images.length || useTools || history.length > 40 || message.length > 8192
+          || history.some(m => !m || !['user','assistant'].includes(m.role) || typeof m.content !== 'string')
+          || history.reduce((n,m) => n + m.content.length, message.length) > 8192)
+        throw new Error('This managed window accepts bounded text for the Lab-selected runtime only.');
+      return await streamChat({ message, history, onFrame, signal,
+        systemPrompt: 'Answer the user directly. Output is inert text. No tools or file access are available.' });
+    } catch (error) { onFrame({ type:'error', message:error.message }); return { error:error.message }; }
+  }
   if (remoteModel) return runRemoteTurn({ selection: remoteModel, message, history, images, onFrame, signal, workspaceId });
   if(native.hasLive()||nativeModelId){
     let instance;try{instance=native.resolveInstance(nativeModelId??native.state().defaultId);}catch(e){const message=plainNoModel(e.message);onFrame({type:'error',message});return {error:message};}const started=Date.now(),cancel=new AbortController();
@@ -921,8 +933,8 @@ const tasks = createTaskService({
     return { text, demo };
   },
 });
-const taskTimer = setInterval(() => tasks.tick(), 15000);
-taskTimer.unref();
+const taskTimer = MANAGED ? null : setInterval(() => tasks.tick(), 15000);
+taskTimer?.unref();
 
 // The share and tunnel listeners take a free port (the next ones above the host's own) instead of a fixed PORT+1 / PORT+2 that Docker, WSL or Hyper-V may hold or reserve.
 const sharePort = await findFreePort(Number(process.env.STRATA_SHARE_PORT ?? PORT + 1), '0.0.0.0', { skip: [PORT] });
@@ -931,7 +943,7 @@ const tunnelPort = await findFreePort(Number(process.env.STRATA_TUNNEL_PORT ?? P
 const tunnelOrigin = createLocalShare({ handle: openai, hasKey: () => !!store.get().serving?.apiKey, host: '127.0.0.1', port: tunnelPort });
 const connector = createConnectorInstaller({ directory: join(store.HOME, 'engine', 'cloudflare'), componentDirectory: join(componentsDirectory(), 'cloudflared') });
 const cloudflare = createCloudflare({ origin: tunnelOrigin, originUrl: `http://127.0.0.1:${tunnelPort}`, hasKey: () => !!store.get().serving?.apiKey, changed: serving.setTunnel, locate: connector.locate, prepareConnector: connector.ensure, connectorInfo: connector.connector, findRunning: findRunningConnector });
-await cloudflare.inspect();
+if (!MANAGED) await cloudflare.inspect();
 
 /* --------------------------------------------------------------- routing --- */
 
@@ -950,6 +962,29 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (labAccess) {
+      const origin = `http://127.0.0.1:${PORT}`;
+      if (req.headers.host !== `127.0.0.1:${PORT}` || (req.headers.origin && req.headers.origin !== origin))
+        return error(res, 403, 'Open this managed window from MicroExpert Lab.');
+      res.setHeader('access-control-allow-origin', origin);
+      res.setHeader('cache-control', 'no-store');
+      if (path === '/api/lab/ticket' && method === 'POST') {
+        try { return json(res, 200, { ticket: labAccess.issue(req) }); }
+        catch { return error(res, 403, 'Lab control authentication required.'); }
+      }
+      if (path === '/api/lab/pair' && method === 'POST') {
+        try { const body = await readBody(req, 1024); res.setHeader('set-cookie', labAccess.pair(body.ticket)); return json(res, 200, { paired: true }); }
+        catch { return error(res, 403, 'The window connection expired. Open Strata from Lab again.'); }
+      }
+      if (path.startsWith('/api/') || path.startsWith('/v1/')) {
+        if (!labAccess.authenticated(req) && !labAccess.trusted(req)) return error(res, 401, 'Open Strata from MicroExpert Lab to connect.');
+        if (path === '/api/lab/managed' && method === 'GET') return json(res, 200, managedStatus(MANAGED));
+        if (path === '/api/control/shutdown' && method === 'POST' && labAccess.trusted(req)) {
+          json(res, 202, { stopping: true }); setImmediate(() => void shutdown()); return;
+        }
+        if (!labAccess.allowed(method, path)) return error(res, 403, 'This operation is not enabled in the Lab-managed window. Review it in MicroExpert Lab.');
+      }
+    }
     if (path.startsWith('/api/') && req.headers.origin) {
       const origin = new URL(req.headers.origin);
       if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) return error(res, 403, 'Open the local Strata app to use host controls.');
@@ -972,6 +1007,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function api(req, res, path, method, url) {
+  if (path === '/api/lab/managed' && method === 'GET') return json(res, 200, { managed: false });
+  if (MANAGED && method === 'GET') {
+    if (path === '/api/setup') return json(res, 200, { ...setupState(), complete: true, dismissed: false });
+    if (path === '/api/skills') return json(res, 200, []);
+    if (path === '/api/workspace') return json(res, 200, { path: WORKSPACE, entries: [] });
+    if (path === '/api/native') return json(res, 200, { ...native.state(), available: false, notice: 'Model lifecycle is managed by MicroExpert Lab.' });
+    if (path === '/api/model-providers') return json(res, 200, { catalog: [], connections: [] });
+    if (path === '/api/agent/status') return json(res, 200, { state: 'unavailable', reason: 'Research and execution tools are not yet qualified for Lab-managed use.' });
+  }
   if(path==='/api/fonts'&&method==='GET')return json(res,200,await systemFonts());
   if (storageChanging && !['GET', 'OPTIONS'].includes(method)) return error(res, 409, 'Wait for the model folder check to finish.');
   // --- events -------------------------------------------------------------
@@ -1971,7 +2015,7 @@ async function api(req, res, path, method, url) {
     /* Agent turn, when the component is there and this request can use it. A client that disappears
        detaches from the turn (it keeps running in the Harness); Stop is its own request. */
     const chatId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : null;
-    const agentSkip = process.env.STRATA_AGENT === 'off' ? 'The agent is turned off (STRATA_AGENT=off).'
+    const agentSkip = MANAGED || process.env.STRATA_AGENT === 'off' ? 'The agent is turned off in this connection.'
       : body.agent === false || body.tools === false ? 'This chat runs without the agent.'
       : !chatId ? 'This request did not name a chat.'
       : !(body.remoteModel || native.hasLive()) ? 'The agent needs a loaded Strata model or an API model.'
