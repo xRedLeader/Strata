@@ -1,15 +1,18 @@
 """Synthetic bounded-server tests; no model files or native engine."""
 import json
 import threading
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, EngineNonFinite, Service, serve
 from serve.test_lifecycle import ResidentEngine
 from serve.test_server import NonFiniteEngine
+from serve import server
 
 
 class LabBounded(unittest.TestCase):
@@ -68,6 +71,28 @@ class LabBounded(unittest.TestCase):
                 with self.assertRaises(EngineNonFinite):
                     list(svc.run([1, 2], False, None, 16, {}, threading.Event()))
                 self.assertEqual(len(engine.calls), 1)
+
+    def test_cli_selects_native_startup_in_both_managed_and_standalone_modes(self):
+        class NativeEntryReached(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, text in {"vocab.json": '{"x":0}', "token_type.json": '[1]', "merges.txt": ''}.items():
+                (root / name).write_text(text, encoding="utf-8")
+            config = root / "fixture-config.json"
+            config.write_text(json.dumps({"exe": str(root / "never-executed.exe"), "cwd": str(root),
+                                         "args": [], "tokenizer": str(root), "model_name": "synthetic"}))
+            for bounded in (False, True):
+                with self.subTest(bounded=bounded):
+                    argv = ["server.py", "--engine", "strata", "--config", str(config), "--host", "127.0.0.1",
+                            "--port", "0", "--offline", "--parallel", "1", "--max-queue", "0"]
+                    if bounded: argv.append("--lab-bounded")
+                    with mock.patch("sys.argv", argv), mock.patch("strata_tokenizer.Tokenizer", return_value=ByteTokenizer()), \
+                         mock.patch.object(server, "effort_end_args", return_value=[]), \
+                         mock.patch.object(server, "StrataEngine", side_effect=NativeEntryReached) as native:
+                        with self.assertRaises(NativeEntryReached): server.main()
+                        native.assert_called_once()
+                        self.assertEqual(native.call_args.args[0], str(root / "never-executed.exe"))
 
 
 if __name__ == "__main__":

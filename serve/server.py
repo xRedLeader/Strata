@@ -8436,8 +8436,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
-    if a.lab_bounded and (a.engine != "strata" or lazy):
-        raise SystemExit("Lab bounded mode requires an eager native Strata engine")
+        if a.lab_bounded and lazy:
+            raise SystemExit("Lab bounded mode requires an eager native Strata engine")
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
