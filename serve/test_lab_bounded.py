@@ -93,6 +93,25 @@ class LabBounded(unittest.TestCase):
                         with self.assertRaises(NativeEntryReached): server.main()
                         native.assert_called_once()
                         self.assertEqual(native.call_args.args[0], str(root / "never-executed.exe"))
+                        self.assertEqual(native.call_args.kwargs.get("allow_start_retry", True), not bounded)
+
+    def test_auxiliary_models_and_fallback_are_rejected_before_native_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, text in {"vocab.json": '{"x":0}', "token_type.json": '[1]', "merges.txt": ''}.items():
+                (root / name).write_text(text, encoding="utf-8")
+            config = root / "fixture-config.json"
+            for key in ("vision", "images", "split_fallback"):
+                with self.subTest(key=key):
+                    config.write_text(json.dumps({"exe": str(root / "never-executed.exe"), "cwd": str(root),
+                        "args": [], "tokenizer": str(root), key: {"exe": str(root / "unapproved.exe")}}))
+                    argv = ["server.py", "--engine", "strata", "--config", str(config), "--offline", "--lab-bounded"]
+                    with mock.patch("sys.argv", argv), mock.patch("strata_tokenizer.Tokenizer", return_value=ByteTokenizer()), \
+                         mock.patch.object(server, "StrataEngine") as native, \
+                         mock.patch.object(server, "apply_vision_defaults", side_effect=lambda cfg: cfg):
+                        with self.assertRaisesRegex(SystemExit, "forbids auxiliary models and engine fallback"):
+                            server.main()
+                        native.assert_not_called()
 
 
 if __name__ == "__main__":

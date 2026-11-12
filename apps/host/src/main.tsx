@@ -5,11 +5,23 @@ import './styles/kit/components.css';
 import './styles/app.css';
 import { App } from './app/App';
 import { installDropGuard } from './components/DropZone';
+import { startRecovery } from './lib/recovery';
+import { translationsReady } from './lib/i18n';
+import { loadHighlighter } from './components/SyntaxCode';
 
 const el = document.getElementById('root');
 if (!el) throw new Error('#root missing');
 
 installDropGuard();
+startRecovery();
+
+// The saved language's strings are fetched while the rest of the code loads; the first screen is drawn once they are in (English needs no wait).
+// Code colouring (the Prism grammars, 130 kB) is not needed to show the first screen: it is fetched a few seconds later, when the browser is idle,
+// so the first code block of the session is already coloured when it appears. A block that appears sooner fetches it itself.
+window.setTimeout(() => {
+  const idle: (run: () => void) => void = 'requestIdleCallback' in window ? (run) => window.requestIdleCallback(run, { timeout: 4000 }) : (run) => window.setTimeout(run, 0);
+  idle(() => { void loadHighlighter(); void import('./components/TimeSkipPanel'); void import('./components/TimeSkipWorking'); });
+}, 3000);
 
 async function openApplication() {
   const ticket = new URLSearchParams(location.hash.slice(1)).get('mel_ticket');
@@ -32,13 +44,14 @@ async function openApplication() {
     back.style.cssText = 'color:inherit;text-decoration:underline';
     const runtime = document.createElement('span');
     runtime.dataset.labRuntime = '1';
-    runtime.textContent = ' Checking owned runtime… ';
+    runtime.textContent = ' Checking owned runtimeâ€¦ ';
     banner.append(runtime, back);
     banner.style.cssText = 'padding:10px 16px;background:#25353f;color:#fff;font:14px system-ui;';
     el!.before(banner);
     document.body.style.cssText = 'display:grid;grid-template-rows:auto minmax(0,1fr)';
     el!.style.minHeight = '0';
   }
+  await translationsReady();
   createRoot(el!).render(
   <StrictMode>
     <App />
@@ -58,3 +71,9 @@ import './styles/onboarding.css';
 import './styles/board.css';
 
 import './styles/gpu-roles.css';
+
+import './styles/engine-tab.css';
+
+// Loaded last: the shared depth, material and interaction treatment. See the
+// header of the file for the order of the layers and why it sits here.
+import './styles/liquid.css';

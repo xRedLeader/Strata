@@ -118,3 +118,29 @@ test('standalone loaded-library send continues through its existing transport',a
   assert.deepEqual(h.calls.map(c=>c.url),['/api/chat/stream']);
   assert.equal(h.store.getState().sessions[0].messages.at(-1).content,'FIXTURE');
 });
+
+for (const [name, text, options] of [
+  ['loop', '/loop 1m check again', {}],
+  ['time-skip', '/time-skip check again', {}],
+  ['loop round', 'hello', {fromLoop:true}],
+  ['goal resume', '', {goalAction:'resume'}],
+  ['plan', '', {planId:'fixture-plan'}],
+  ['reattach', '', {reattach:'fixture-chat'}],
+]) {
+  test(`managed ${name} cannot dispatch new upstream automation paths`,async()=>{
+    const h=harness();
+    await h.store.sendMessage(text,options);
+    assert.deepEqual(h.calls,[]);
+    assert.equal(h.store.getState().sessions.length,0);
+    assert.equal(h.store.getState().toasts.at(-1)?.title,'Use the bounded Lab conversation');
+  });
+}
+
+test('managed busy send cannot queue work for later execution',async()=>{
+  const h=harness();
+  Object.assign(h.store.getState(),{streaming:true,activeSession:'fixture-chat'});
+  await h.store.sendMessage('run this later');
+  assert.deepEqual(h.calls,[]);
+  assert.equal(h.store.getState().sessions.length,0);
+  assert.equal(h.store.getState().toasts.at(-1)?.title,'Use the bounded Lab conversation');
+});
